@@ -19,21 +19,21 @@ void EnableDebugPriv()
 	CloseHandle(hToken);
 }
 
-IOCTLProcess* HandleHijacking(const char* targetProcess, uint32_t handleMinValue)
+ProcessWithHandle HandleHijacking(const char* targetProcess, uint32_t handleMinValue)
 {
 	// Enable working with system processes.
 	EnableDebugPriv();
 	const auto intermediateProcess = handle_hijacking::FindProcess(targetProcess, handleMinValue);
-	if (!intermediateProcess.handle) return nullptr;
-	return new IOCTLProcess(intermediateProcess.processId, intermediateProcess.handle);
+	if (!intermediateProcess.handle) return ProcessWithHandle{0};
+	return intermediateProcess;
 }
 
-handle_hijacking::ProcessWithHandle handle_hijacking::FindProcess(const char* targetProcess, uint32_t handleMinValue)
+ProcessWithHandle handle_hijacking::FindProcess(const char* targetProcess, uint32_t handleMinValue)
 {
-	handle_hijacking::ProcessWithHandle result{ 0, nullptr };
+	ProcessWithHandle result{ 0, nullptr };
 
 	// I use svchost as it opens handle for all um processes, as I know :/
-	// To not open a handle to it, xd. Idk about better way to know process name :/
+	// To not open a handle to it during searching process, xd. Idk about better way to know process name :/
 	const auto targetProcessID = mylib::GetProcessID(targetProcess);
 
 	// Just get a number of handles to alloc memory.
@@ -67,7 +67,8 @@ handle_hijacking::ProcessWithHandle handle_hijacking::FindProcess(const char* ta
 			continue;
 		}
 		if (!DuplicateHandle(tempHandle, reinterpret_cast<HANDLE>(handleInfo.HandleValue), currentProcess,
-			&tempTargetHandle, NULL, FALSE, DUPLICATE_SAME_ACCESS)) // Note: avoid DuplicateHandle.
+			&tempTargetHandle, NULL, FALSE, DUPLICATE_SAME_ACCESS)) 
+			// Note: avoid DuplicateHandle. I will not use this handle more, so, I guess, it's ud.
 		{
 			CloseHandle(tempHandle);
 			continue;
@@ -88,16 +89,81 @@ handle_hijacking::ProcessWithHandle handle_hijacking::FindProcess(const char* ta
 	return result;
 }
 
-void IOCTLProcess::UnloadHelpLibrary()
+IOCTLProcess::IOCTLProcess(ProcessWithHandle process) :
+	IntermediateProcessClass(process.processId, process.handle, __func__)
 {
-	this->sharedMemory->flag = handle_hijacking::ioctlCodes::close;
-	const auto thread = CreateRemoteThread(this->intermediateProcess, nullptr, NULL,
-		reinterpret_cast<LPTHREAD_START_ROUTINE>(sharedMemory->ioctlFuncAddress), nullptr, NULL, nullptr);
-	WaitForSingleObject(thread, INFINITE);
-	CloseHandle(thread);
+	
 }
 
-IOCTLProcess::IOCTLProcess(DWORD processId, HANDLE targetHandle)
+void IOCTLProcess::Write(void* address, uint8_t* buffer, size_t bufferSize)
+{
+	size_t offset = 0;
+	while (bufferSize > sizeof(sharedMemory->buffer))
+	{
+		this->sharedMemory->flag = handle_hijacking::IOCTLFlag::write;
+		this->sharedMemory->bufSize = sizeof(sharedMemory->buffer);
+		this->sharedMemory->address = reinterpret_cast<void*>(reinterpret_cast<uint64_t>(address)+offset);
+		memcpy(this->sharedMemory->buffer, buffer+offset, sizeof(sharedMemory->buffer));
+		this->CallIntermediateFunc();
+		bufferSize -= sizeof(sharedMemory->buffer);
+		offset += sizeof(sharedMemory->buffer);
+	}
+	if (bufferSize)
+	{
+		this->sharedMemory->flag = handle_hijacking::IOCTLFlag::write;
+		this->sharedMemory->bufSize = bufferSize;
+		this->sharedMemory->address = reinterpret_cast<void*>(reinterpret_cast<uint64_t>(address) + offset);
+		memcpy(this->sharedMemory->buffer, buffer+offset, bufferSize);
+		this->CallIntermediateFunc();
+	}
+}
+
+void IOCTLProcess::Read(void* address, uint8_t* buffer, size_t bufferSize)
+{
+	size_t offset = 0;
+	while (bufferSize > sizeof(sharedMemory->buffer))
+	{
+		this->sharedMemory->flag = handle_hijacking::IOCTLFlag::read;
+		this->sharedMemory->bufSize = sizeof(sharedMemory->buffer);
+		this->sharedMemory->address = reinterpret_cast<void*>(reinterpret_cast<uint64_t>(address) + offset);
+		this->CallIntermediateFunc();
+		memcpy(buffer+offset, this->sharedMemory->buffer, sizeof(sharedMemory->buffer));
+		bufferSize -= sizeof(sharedMemory->buffer);
+		offset += sizeof(sharedMemory->buffer);
+	}
+	if (bufferSize)
+	{
+		this->sharedMemory->flag = handle_hijacking::IOCTLFlag::read;
+		this->sharedMemory->bufSize = bufferSize;
+		this->sharedMemory->address = reinterpret_cast<void*>(reinterpret_cast<uint64_t>(address) + offset);
+		this->CallIntermediateFunc();
+		memcpy(buffer + offset, this->sharedMemory->buffer, sizeof(sharedMemory->buffer));
+	}
+}
+
+void* IOCTLProcess::Alloc(size_t bufferSize)
+{
+	this->sharedMemory->flag = handle_hijacking::IOCTLFlag::alloc;
+	this->sharedMemory->bufSize = bufferSize;
+	this->sharedMemory->address = nullptr;
+	this->CallIntermediateFunc();
+	return this->sharedMemory->address;
+}
+
+void IOCTLProcess::Free(void* address, size_t bufferSize)
+{
+	this->sharedMemory->flag = handle_hijacking::IOCTLFlag::release;
+	this->sharedMemory->bufSize = bufferSize;
+	this->sharedMemory->address = address;
+	this->CallIntermediateFunc();
+}
+
+IOCTLProcess::~IOCTLProcess()
+{
+
+}
+
+IntermediateProcessClass::IntermediateProcessClass(DWORD processId, HANDLE targetHandle, const char* name)
 {
 	this->intermediateProcess = OpenProcess(
 		// CreateRemoteThread
@@ -112,7 +178,7 @@ IOCTLProcess::IOCTLProcess(DWORD processId, HANDLE targetHandle)
 		PAGE_READWRITE,
 		0,
 		sizeof(handle_hijacking::SharedMemory),
-		"Global\\MySharedMemory"); // Fix it. Should be random string. Allows several ioctl pipes :)
+		(std::string("Global\\") + name).c_str()); // Fix it. Should be random string. Allows several ioctl pipes :)
 
 	if (!this->hMapFile) return;
 	this->sharedMemory = reinterpret_cast<handle_hijacking::SharedMemory*>
@@ -124,44 +190,113 @@ IOCTLProcess::IOCTLProcess(DWORD processId, HANDLE targetHandle)
 
 	// Inject dll with func which will help implement a data pipe.
 	char fullPath[MAX_PATH];
-	if (!GetFullPathNameA("IOCTLLibrary.dll", MAX_PATH, fullPath, nullptr)) return;
+	if (!GetFullPathNameA((std::string(name) + ".dll").c_str(), MAX_PATH, fullPath, nullptr)) return;
 	const auto alloc = VirtualAllocEx(this->intermediateProcess, nullptr, MAX_PATH, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 	if (!alloc) return;
-	if(!WriteProcessMemory(this->intermediateProcess, alloc, fullPath, MAX_PATH, nullptr)) return;
+	if (!WriteProcessMemory(this->intermediateProcess, alloc, fullPath, MAX_PATH, nullptr)) return;
 	const auto thread = CreateRemoteThread(this->intermediateProcess, nullptr, NULL,
 		reinterpret_cast<LPTHREAD_START_ROUTINE>(LoadLibraryA), alloc, NULL, nullptr);
 	WaitForSingleObject(thread, INFINITE);
 	CloseHandle(thread);
 }
 
-void IOCTLProcess::Write(void* address, uint8_t* buffer, size_t bufferSize)
+IntermediateProcessClass::~IntermediateProcessClass()
 {
-	this->sharedMemory->flag = handle_hijacking::ioctlCodes::write;
-	this->sharedMemory->bufSize = bufferSize;
-	this->sharedMemory->address = address;
-	memcpy(this->sharedMemory->buffer, buffer, bufferSize);
+	// Reserved close flag.
+	this->sharedMemory->flag = -1;
 	const auto thread = CreateRemoteThread(this->intermediateProcess, nullptr, NULL,
-		reinterpret_cast<LPTHREAD_START_ROUTINE>(this->sharedMemory->ioctlFuncAddress), nullptr, NULL, nullptr);
+		reinterpret_cast<LPTHREAD_START_ROUTINE>(sharedMemory->funcAddress), nullptr, NULL, nullptr);
 	WaitForSingleObject(thread, INFINITE);
 	CloseHandle(thread);
-}
-
-void IOCTLProcess::Read(void* address, uint8_t* buffer, size_t bufferSize)
-{
-	this->sharedMemory->flag = handle_hijacking::ioctlCodes::read;
-	this->sharedMemory->bufSize = bufferSize;
-	this->sharedMemory->address = address;
-	const auto thread = CreateRemoteThread(this->intermediateProcess, nullptr, NULL,
-		reinterpret_cast<LPTHREAD_START_ROUTINE>(this->sharedMemory->ioctlFuncAddress), (void*)0x23164850C14, NULL, nullptr);
-	WaitForSingleObject(thread, INFINITE);
-	CloseHandle(thread);
-	memcpy(buffer, this->sharedMemory->buffer, bufferSize);
-}
-
-IOCTLProcess::~IOCTLProcess()
-{
-	this->UnloadHelpLibrary();
 	UnmapViewOfFile(this->sharedMemory);
 	CloseHandle(this->hMapFile);
 	CloseHandle(this->intermediateProcess);
+}
+
+void IntermediateProcessClass::CallIntermediateFunc()
+{
+	const auto thread = CreateRemoteThread(this->intermediateProcess, nullptr, NULL,
+		reinterpret_cast<LPTHREAD_START_ROUTINE>(this->sharedMemory->funcAddress), nullptr, NULL, nullptr);
+	WaitForSingleObject(thread, INFINITE);
+	CloseHandle(thread);
+}
+
+ThreadProcess::ThreadProcess(ProcessWithHandle process) :
+	IntermediateProcessClass(process.processId, process.handle, __func__)
+{
+}
+
+DWORD ThreadProcess::GetThreadId()
+{
+	this->sharedMemory->flag = handle_hijacking::ThreadFlag::getThreadId;
+	this->CallIntermediateFunc();
+	return *reinterpret_cast<DWORD*>(this->sharedMemory->buffer);
+}
+
+HANDLE ThreadProcess::OpenThread(DWORD pid)
+{
+	this->sharedMemory->flag = handle_hijacking::ThreadFlag::openThread;
+	*reinterpret_cast<DWORD*>(this->sharedMemory->buffer) = pid;
+	this->CallIntermediateFunc();
+	return *reinterpret_cast<HANDLE*>(this->sharedMemory->buffer);
+}
+
+void ThreadProcess::SuspendThread(HANDLE thread)
+{
+	this->sharedMemory->flag = handle_hijacking::ThreadFlag::suspendThread;
+	*reinterpret_cast<HANDLE*>(sharedMemory->buffer) = thread;
+	this->CallIntermediateFunc();
+}
+
+void ThreadProcess::GetThreadContext(HANDLE thread, CONTEXT* context)
+{
+	this->sharedMemory->flag = handle_hijacking::ThreadFlag::getThreadContext;
+	*reinterpret_cast<HANDLE*>(this->sharedMemory->buffer) = thread;
+	*reinterpret_cast<CONTEXT*>(this->sharedMemory->buffer+sizeof(HANDLE)) = *context;
+	this->CallIntermediateFunc();
+	*context = *reinterpret_cast<CONTEXT*>(this->sharedMemory->buffer);
+}
+
+void ThreadProcess::SetThreadContext(HANDLE thread, const CONTEXT* context)
+{
+	this->sharedMemory->flag = handle_hijacking::ThreadFlag::setThreadContext;
+	*reinterpret_cast<HANDLE*>(this->sharedMemory->buffer) = thread;
+	*reinterpret_cast<CONTEXT*>(this->sharedMemory->buffer+sizeof(HANDLE)) = *context;
+	this->CallIntermediateFunc();
+}
+
+void ThreadProcess::ResumeThread(HANDLE thread)
+{
+	this->sharedMemory->flag = handle_hijacking::ThreadFlag::resumeThread;
+	*reinterpret_cast<HANDLE*>(this->sharedMemory->buffer) = thread;
+	this->CallIntermediateFunc();
+}
+
+void ThreadProcess::CloseHandle(HANDLE thread)
+{
+	this->sharedMemory->flag = handle_hijacking::ThreadFlag::closeHandle;
+	*reinterpret_cast<HANDLE*>(this->sharedMemory->buffer) = thread;
+	this->CallIntermediateFunc();
+}
+
+void ThreadProcess::GetThreadContext64(HANDLE thread, WOW64_CONTEXT* context)
+{
+	this->sharedMemory->flag = handle_hijacking::ThreadFlag::getThreadContext64;
+	*reinterpret_cast<HANDLE*>(this->sharedMemory->buffer) = thread;
+	*reinterpret_cast<WOW64_CONTEXT*>(this->sharedMemory->buffer + sizeof(HANDLE)) = *context;
+	this->CallIntermediateFunc();
+	*context = *reinterpret_cast<WOW64_CONTEXT*>(this->sharedMemory->buffer);
+}
+
+void ThreadProcess::ChangeRip(HANDLE thread, uint64_t* rip)
+{
+	this->sharedMemory->flag = handle_hijacking::ThreadFlag::changeRip;
+	*reinterpret_cast<HANDLE*>(this->sharedMemory->buffer) = thread;
+	*reinterpret_cast<uint64_t*>(this->sharedMemory->buffer + sizeof(HANDLE)) = *rip;
+	this->CallIntermediateFunc();
+	*rip = *reinterpret_cast<uint64_t*>(this->sharedMemory->buffer);
+}
+
+ThreadProcess::~ThreadProcess()
+{
 }
